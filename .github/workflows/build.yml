@@ -1,6 +1,7 @@
 # Application Morocco — build robot.
 # Every 10 minutes it asks the site for waiting builds, downloads the Flutter source from the site,
 # brands it for the customer (name, logo, icon) and uploads the Windows installer and the Android .apk.
+# On request from admin it also rebuilds the web app and photographs every demo for the site.
 # The repository only holds this file: the source code stays on your server.
 # One repository secret is needed: BUILD_SECRET (admin > Desktop & Mobile Builds > Build secret).
 name: Build robot
@@ -24,13 +25,16 @@ jobs:
       android_code: ${{ steps.next.outputs.android_code }}
       windows_id: ${{ steps.next.outputs.windows_id }}
       windows_code: ${{ steps.next.outputs.windows_code }}
+      web: ${{ steps.next.outputs.web }}
+      shots: ${{ steps.next.outputs.shots }}
+      version: ${{ steps.next.outputs.version }}
     steps:
       - id: next
         env:
           BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
         run: |
           J=$(curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" "$SERVER/api/build/next")
-          for k in android_id android_code windows_id windows_code; do
+          for k in android_id android_code windows_id windows_code web shots version; do
             echo "$k=$(echo "$J" | jq -r ".$k // empty")" >> "$GITHUB_OUTPUT"
           done
       # GitHub pauses scheduled robots after 60 days without commits: a tiny commit once a month keeps it awake.
@@ -148,3 +152,83 @@ jobs:
         if: failure()
         run: |
           curl.exe -sS -H "Authorization: Bearer $env:BUILD_SECRET" -H "Content-Type: application/json" -d '{\"message\":\"Build robot failed (GitHub Actions)\"}' "$env:SERVER/api/build/$env:BUILD_ID/fail" | Out-Null
+
+  web:
+    needs: poll
+    if: needs.poll.outputs.web != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
+      APP_VERSION: ${{ needs.poll.outputs.version }}
+    steps:
+      - name: Source from the site
+        run: |
+          curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -o src.zip "$SERVER/api/build/source"
+          unzip -q src.zip && rm src.zip
+          [ -d flutter_app ] && shopt -s dotglob && mv flutter_app/* . && rmdir flutter_app || true
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: |
+          flutter create . --platforms=web --project-name manara_apps --org ma.applicationmorocco > /dev/null
+      - run: |
+          flutter pub get > /dev/null
+      - name: Build web
+        run: |
+          flutter build web --release --pwa-strategy=none --dart-define=APP_VERSION="${APP_VERSION:-1.0.0}"
+      - name: Publish on the site
+        run: |
+          cd build/web && rm -f index.html && zip -qr ../../web.zip . && cd ../..
+          curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -F "file=@web.zip;filename=web.zip" "$SERVER/api/build/web"
+
+  shots:
+    needs: [poll, web]
+    if: always() && needs.poll.result == 'success' && (needs.poll.outputs.shots != '' || needs.web.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: |
+          npm init -y > /dev/null && npm i playwright@1.47.2 > /dev/null && npx playwright install --with-deps chromium > /dev/null
+      - name: Photograph every demo
+        run: |
+          curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -o demos.json "$SERVER/api/build/demos"
+          cat > shots.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          (async () => {
+            const demos = JSON.parse(fs.readFileSync('demos.json', 'utf8')).demos || [];
+            const browser = await chromium.launch();
+            let ok = 0;
+            for (const d of demos) {
+              const ctx = await browser.newContext({ viewport: { width: 1366, height: 800 }, deviceScaleFactor: 1, locale: 'fr-FR' });
+              const page = await ctx.newPage();
+              try {
+                await page.goto(process.env.SERVER + '/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await page.evaluate(([c, t]) => {
+                  localStorage.setItem('flutter.tok_' + c, JSON.stringify(t));
+                  localStorage.setItem('flutter.lang_' + c, JSON.stringify('fr'));
+                }, [d.code, d.token]);
+                await page.goto(process.env.SERVER + '/' + d.code, { waitUntil: 'load', timeout: 60000 });
+                await page.waitForTimeout(9000);
+                await page.screenshot({ path: 'shot.png' });
+                const { execFileSync } = require('child_process');
+                execFileSync('curl', ['-sS', '--fail', '-H', 'Authorization: Bearer ' + process.env.BUILD_SECRET, '-F', 'file=@shot.png;type=image/png', process.env.SERVER + '/api/build/shot/' + d.slug]);
+                ok++;
+                console.log('ok ' + d.slug);
+              } catch (e) {
+                console.log('skip ' + d.slug + ': ' + e.message.split('\n')[0]);
+              }
+              await ctx.close();
+            }
+            await browser.close();
+            console.log(ok + ' / ' + demos.length + ' screenshots');
+          })();
+          JS
+          node shots.js
