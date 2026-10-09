@@ -1,0 +1,150 @@
+# Application Morocco — build robot.
+# Every 10 minutes it asks the site for waiting builds, downloads the Flutter source from the site,
+# brands it for the customer (name, logo, icon) and uploads the Windows installer and the Android .apk.
+# The repository only holds this file: the source code stays on your server.
+# One repository secret is needed: BUILD_SECRET (admin > Desktop & Mobile Builds > Build secret).
+name: Build robot
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SERVER: https://handourtraveltours.sbs
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    outputs:
+      android_id: ${{ steps.next.outputs.android_id }}
+      android_code: ${{ steps.next.outputs.android_code }}
+      windows_id: ${{ steps.next.outputs.windows_id }}
+      windows_code: ${{ steps.next.outputs.windows_code }}
+    steps:
+      - id: next
+        env:
+          BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
+        run: |
+          J=$(curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" "$SERVER/api/build/next")
+          for k in android_id android_code windows_id windows_code; do
+            echo "$k=$(echo "$J" | jq -r ".$k // empty")" >> "$GITHUB_OUTPUT"
+          done
+      # GitHub pauses scheduled robots after 60 days without commits: a tiny commit once a month keeps it awake.
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt 2592000 ]; then
+            date -u > keepalive.txt
+            git config user.name "build-robot"; git config user.email "robot@users.noreply.github.com"
+            git add keepalive.txt && git commit -qm "keep alive" && git push -q
+          fi
+
+  android:
+    needs: poll
+    if: needs.poll.outputs.android_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      BUILD_ID: ${{ needs.poll.outputs.android_id }}
+      CODE: ${{ needs.poll.outputs.android_code }}
+      BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
+    steps:
+      - name: Source from the site
+        run: |
+          curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -o src.zip "$SERVER/api/build/source"
+          unzip -q src.zip && rm src.zip
+          [ -d flutter_app ] && shopt -s dotglob && mv flutter_app/* . && rmdir flutter_app || true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - name: Same signing key for every update
+        run: |
+          mkdir -p ~/.android
+          if curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -o ~/.android/debug.keystore "$SERVER/api/build/keystore"; then
+            echo "key restored"
+          else
+            rm -f ~/.android/debug.keystore
+            keytool -genkeypair -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" > /dev/null 2>&1
+            curl -sS -H "Authorization: Bearer $BUILD_SECRET" -F "file=@$HOME/.android/debug.keystore" "$SERVER/api/build/keystore" > /dev/null
+          fi
+      - run: |
+          flutter create . --platforms=android --project-name manara_apps --org ma.applicationmorocco > /dev/null
+      - run: |
+          flutter pub get > /dev/null
+      - name: Brand for the customer
+        run: |
+          dart run tool/brand.dart --server "$SERVER" --code "$CODE" > /dev/null
+          cat brand.env >> "$GITHUB_ENV"
+      - name: Build (compiled + obfuscated)
+        run: >
+          flutter build apk --release --obfuscate --split-debug-info=build/symbols
+          --build-name="$APP_VERSION" --build-number="$BUILD_NUMBER"
+          --dart-define=API_BASE="$SERVER" --dart-define=TENANT="$CODE"
+          --dart-define=APP_VERSION="$APP_VERSION" --dart-define=APP_NAME="$APP_NAME"
+      - name: Upload to the site
+        run: |
+          curl -sS --fail -H "Authorization: Bearer $BUILD_SECRET" -F "file=@build/app/outputs/flutter-apk/app-release.apk;filename=app.apk" "$SERVER/api/build/$BUILD_ID/upload" > /dev/null
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -sS -H "Authorization: Bearer $BUILD_SECRET" -H "Content-Type: application/json" -d '{"message":"Build robot failed (GitHub Actions)"}' "$SERVER/api/build/$BUILD_ID/fail" > /dev/null || true
+
+  windows:
+    needs: poll
+    if: needs.poll.outputs.windows_id != ''
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_ID: ${{ needs.poll.outputs.windows_id }}
+      CODE: ${{ needs.poll.outputs.windows_code }}
+      BUILD_SECRET: ${{ secrets.BUILD_SECRET }}
+    steps:
+      - name: Source from the site
+        run: |
+          curl.exe -sS --fail -H "Authorization: Bearer $env:BUILD_SECRET" -o src.zip "$env:SERVER/api/build/source"
+          Expand-Archive src.zip -DestinationPath . ; Remove-Item src.zip
+          if (Test-Path flutter_app) { Get-ChildItem flutter_app -Force | Move-Item -Destination . ; Remove-Item flutter_app }
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+      - run: |
+          flutter create . --platforms=windows --project-name manara_apps --org ma.applicationmorocco | Out-Null
+      - run: |
+          flutter pub get | Out-Null
+      - name: Brand for the customer
+        run: |
+          dart run tool/brand.dart --server "$env:SERVER" --code "$env:CODE" | Out-Null
+          Get-Content brand.env -Encoding utf8 | Add-Content $env:GITHUB_ENV -Encoding utf8
+      - name: Build (compiled + obfuscated)
+        run: |
+          flutter build windows --release --obfuscate --split-debug-info=build/symbols "--build-name=$env:APP_VERSION" "--build-number=$env:BUILD_NUMBER" "--dart-define=API_BASE=$env:SERVER" "--dart-define=TENANT=$env:CODE" "--dart-define=APP_VERSION=$env:APP_VERSION" "--dart-define=APP_NAME=$env:APP_NAME"
+      - name: Installer
+        run: |
+          $rel = Resolve-Path build/windows/x64/runner/Release
+          foreach ($dll in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') { Copy-Item "$env:WINDIR\System32\$dll" $rel -ErrorAction SilentlyContinue }
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          & $iscc "/DAppName=$env:SAFE_NAME" "/DAppVersion=$env:APP_VERSION" "/DExeName=$env:BINARY_NAME.exe" "/DExeBase=$env:BINARY_NAME" "/DAppCode=$env:APP_CODE" "/DSourceDir=$rel" "/DIconFile=$(Resolve-Path windows/runner/resources/app_icon.ico)" "/DOutputDir=$(Resolve-Path dist)" installer/client.iss | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+      - name: Upload to the site
+        run: |
+          curl.exe -sS --fail -H "Authorization: Bearer $env:BUILD_SECRET" -F "file=@dist/setup.exe;filename=setup.exe" "$env:SERVER/api/build/$env:BUILD_ID/upload" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Upload failed" }
+      - name: Report failure
+        if: failure()
+        run: |
+          curl.exe -sS -H "Authorization: Bearer $env:BUILD_SECRET" -H "Content-Type: application/json" -d '{\"message\":\"Build robot failed (GitHub Actions)\"}' "$env:SERVER/api/build/$env:BUILD_ID/fail" | Out-Null
